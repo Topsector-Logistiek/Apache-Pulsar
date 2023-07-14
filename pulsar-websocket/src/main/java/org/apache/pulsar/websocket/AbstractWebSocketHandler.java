@@ -19,6 +19,7 @@
 package org.apache.pulsar.websocket;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectReader;
 import com.fasterxml.jackson.databind.ObjectWriter;
 import com.google.common.annotations.VisibleForTesting;
@@ -51,18 +52,26 @@ import org.apache.pulsar.client.api.PulsarClientException.TimeoutException;
 import org.apache.pulsar.client.api.PulsarClientException.TooManyRequestsException;
 import org.apache.pulsar.client.api.PulsarClientException.TopicDoesNotExistException;
 import org.apache.pulsar.client.api.PulsarClientException.TopicTerminatedException;
+import org.apache.pulsar.common.api.AuthData;
 import org.apache.pulsar.common.naming.NamespaceName;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.util.Codec;
 import org.apache.pulsar.common.util.ObjectMapperFactory;
+import org.apache.pulsar.websocket.data.AuthChallenge;
+import org.apache.pulsar.websocket.data.AuthResponse;
+import org.apache.pulsar.websocket.data.Challenge;
+import org.apache.pulsar.websocket.data.CommandAuthChallenge;
+import org.apache.pulsar.websocket.data.CommandAuthResponse;
+import org.apache.pulsar.websocket.data.CommandError;
 import org.apache.pulsar.websocket.data.ConsumerCommand;
+import org.apache.pulsar.websocket.data.ServerError;
+import org.apache.pulsar.websocket.data.protocol.PulsarWebsocketDecoder;
 import org.eclipse.jetty.websocket.api.Session;
-import org.eclipse.jetty.websocket.api.WebSocketAdapter;
 import org.eclipse.jetty.websocket.servlet.ServletUpgradeResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public abstract class AbstractWebSocketHandler extends WebSocketAdapter implements Closeable {
+public abstract class AbstractWebSocketHandler extends PulsarWebsocketDecoder implements Closeable {
 
     protected final WebSocketService service;
     protected final HttpServletRequest request;
@@ -70,10 +79,16 @@ public abstract class AbstractWebSocketHandler extends WebSocketAdapter implemen
     protected final TopicName topic;
     protected final Map<String, String> queryParams;
     private static final String PULSAR_AUTH_METHOD_NAME = "X-Pulsar-Auth-Method-Name";
-    protected final ObjectReader consumerCommandReader =
-            ObjectMapperFactory.getMapper().reader().forType(ConsumerCommand.class);
+    protected final ObjectReader consumerCommandReader = ObjectMapperFactory.getMapper().reader()
+            .forType(ConsumerCommand.class);
+
+    private AuthenticationState authState;
+    private String authRole = null;
+    private String authMethodName = "none";
+    private boolean pendingAuthChallengeResponse = false;
 
     private ScheduledFuture<?> pingFuture;
+    private ScheduledFuture<?> authRefreshFuture;
 
     public AbstractWebSocketHandler(WebSocketService service,
                                     HttpServletRequest request,
@@ -89,19 +104,19 @@ public abstract class AbstractWebSocketHandler extends WebSocketAdapter implemen
     }
 
     protected boolean checkAuth(ServletUpgradeResponse response) {
-        String authRole = "<none>";
-        String authMethodName = request.getHeader(PULSAR_AUTH_METHOD_NAME);
-        AuthenticationState authenticationState = null;
+        authRole = "<none>";
+        authMethodName = request.getHeader(PULSAR_AUTH_METHOD_NAME);
+        authState = null;
         if (service.isAuthenticationEnabled()) {
             try {
                 if (authMethodName != null
                         && service.getAuthenticationService().getAuthenticationProvider(authMethodName) != null) {
-                    authenticationState = service.getAuthenticationService()
+                    authState = service.getAuthenticationService()
                             .getAuthenticationProvider(authMethodName).newHttpAuthState(request);
                 }
-                if (authenticationState != null) {
+                if (authState != null) {
                     authRole = service.getAuthenticationService()
-                            .authenticateHttpRequest(request, authenticationState.getAuthDataSource());
+                            .authenticateHttpRequest(request, authState.getAuthDataSource());
                 } else {
                     authRole = service.getAuthenticationService().authenticateHttpRequest(request);
                 }
@@ -123,8 +138,8 @@ public abstract class AbstractWebSocketHandler extends WebSocketAdapter implemen
 
         if (service.isAuthorizationEnabled()) {
             AuthenticationDataSource authenticationData;
-            if (authenticationState != null) {
-                authenticationData = authenticationState.getAuthDataSource();
+            if (authState != null) {
+                authenticationData = authState.getAuthDataSource();
             } else {
                 authenticationData = new AuthenticationDataHttps(request);
             }
@@ -188,6 +203,27 @@ public abstract class AbstractWebSocketHandler extends WebSocketAdapter implemen
         }
     }
 
+    private void closeAuthRefreshFuture() {
+        if (authRefreshFuture != null && !authRefreshFuture.isDone()) {
+            authRefreshFuture.cancel(true);
+        }
+    }
+
+    public static CommandAuthChallenge newAuthChallenge(String authMethodName, AuthData brokerData,
+            int protocolVersion) {
+
+        CommandAuthChallenge commandAuthChallenge = new CommandAuthChallenge();
+        AuthChallenge authChallenge = new AuthChallenge();
+        Challenge challenge = new Challenge(authMethodName, authMethodName);
+
+        authChallenge.setProtocolVersion(protocolVersion);
+        commandAuthChallenge.setAuthChallenge(authChallenge);
+
+        authChallenge.setChallenge(challenge);
+
+        return commandAuthChallenge;
+    }
+
     @Override
     public void onWebSocketConnect(Session session) {
         super.onWebSocketConnect(session);
@@ -201,7 +237,93 @@ public abstract class AbstractWebSocketHandler extends WebSocketAdapter implemen
                 }
             }, webSocketPingDurationSeconds, webSocketPingDurationSeconds, TimeUnit.SECONDS);
         }
+        int authenticationRefreshCheckSeconds = service.getConfig().getAuthenticationRefreshCheckSeconds();
+        if (authenticationRefreshCheckSeconds > 0) {
+            authRefreshFuture = service.getExecutor().scheduleAtFixedRate(() -> {
+                try {
+                    if (!authState.isExpired()) {
+                        // Credentials are still valid. Nothing to do at this point
+                        return;
+                    }
+
+                    if (pendingAuthChallengeResponse) {
+                        log.warn("[{}] Closing connection after timeout on refreshing auth credentials",
+                                session.getRemoteAddress());
+                        session.close();
+                        return;
+                    }
+
+                    AuthData brokerData = authState.refreshAuthentication();
+                    CommandAuthChallenge commandAuthChallenge = newAuthChallenge(authMethodName, brokerData, 21);
+                    String commandAuthChallengeString = objectWriter().writeValueAsString(commandAuthChallenge);
+
+                    session.getRemote().sendString(commandAuthChallengeString);
+                    pendingAuthChallengeResponse = true;
+                } catch (javax.naming.AuthenticationException | IOException e) {
+                    log.warn("[{}] Websocket Auth refresh", getSession().getRemoteAddress(), e);
+                } catch (Exception e) {
+                    log.warn("[{}] Websocket Auth refresh general Exception", getSession().getRemoteAddress(), e);
+
+                }
+            }, authenticationRefreshCheckSeconds, authenticationRefreshCheckSeconds, TimeUnit.SECONDS);
+        }
         log.info("[{}] New WebSocket session on topic {}", session.getRemoteAddress(), topic);
+    }
+
+    @Override
+    protected void handleAuthResponse(CommandAuthResponse commandAuthResponse) {
+        AuthResponse authResponse = commandAuthResponse.getAuthResponse();
+        pendingAuthChallengeResponse = false;
+
+        if (log.isDebugEnabled()) {
+            log.debug("Received AuthResponse from {}, auth method: {}",
+                    getRemote().getInetSocketAddress(), authResponse.getResponse().getAuthMethodName());
+        }
+
+        try {
+            AuthData clientData = AuthData
+                    .of(authResponse.getResponse().getAuthData().getBytes(StandardCharsets.UTF_8));
+            doAuthentication(clientData, false, authResponse.getProtocolVersion(),
+                    authResponse.hasClientVersion() ? authResponse.getClientVersion() : EMPTY);
+        } catch (Exception e) {
+            log.warn("[{}] Websocket handleAuthResponse general Exception", getSession().getRemoteAddress(), e);
+            authenticationFailed(e);
+        }
+    }
+
+    // According to auth result, send Connected, AuthChallenge, or Error command.
+    private void doAuthentication(AuthData clientData,
+            boolean useOriginalAuthState,
+            int clientProtocolVersion,
+            final String clientVersion) {
+
+        if (log.isDebugEnabled()) {
+            log.debug("Authenticate using original auth state : {}, role = {}", useOriginalAuthState, authRole);
+        }
+
+        authState
+                .authenticateAsync(clientData)
+                .whenCompleteAsync((authChallenge, throwable) -> {
+                    if (throwable != null) {
+                        authenticationFailed(throwable);
+                    }
+                }, service.getExecutor());
+    }
+
+    // Handle authentication and authentication refresh failures. Must be called
+    // from event loop.
+    private void authenticationFailed(Throwable t) {
+        try {
+            CommandError commandError = new CommandError(-1, ServerError.AuthenticationError, "Failed to authenticate");
+            String commandErrorString = objectWriter().writeValueAsString(commandError);
+            getSession().getRemote().sendString(commandErrorString);
+        } catch (JsonProcessingException e) {
+            log.error("[{}] Error in sending authentication failure message: {}",
+            getRemote().getInetSocketAddress(), e);
+        } catch (IOException e) {
+            log.error("[{}] Error in sending authentication failure message: {}",
+            getRemote().getInetSocketAddress(), e);
+        }
     }
 
     @Override
@@ -210,6 +332,7 @@ public abstract class AbstractWebSocketHandler extends WebSocketAdapter implemen
         log.info("[{}] WebSocket error on topic {} : {}", getSession().getRemoteAddress(), topic, cause.getMessage());
         try {
             closePingFuture();
+            closeAuthRefreshFuture();
             close();
         } catch (IOException e) {
             log.error("Failed in closing WebSocket session for topic {} with error: {}", topic, e.getMessage());
@@ -222,6 +345,7 @@ public abstract class AbstractWebSocketHandler extends WebSocketAdapter implemen
                 topic, statusCode, reason);
         try {
             closePingFuture();
+            closeAuthRefreshFuture();
             close();
         } catch (IOException e) {
             log.warn("[{}] Failed to close handler for topic {}. ", getSession().getRemoteAddress(), topic, e);
@@ -295,6 +419,10 @@ public abstract class AbstractWebSocketHandler extends WebSocketAdapter implemen
         return pingFuture;
     }
 
+    @VisibleForTesting
+    public ScheduledFuture<?> getAuthRefreshFuture() {
+        return authRefreshFuture;
+    }
 
     protected abstract Boolean isAuthorized(String authRole,
                                             AuthenticationDataSource authenticationData) throws Exception;
