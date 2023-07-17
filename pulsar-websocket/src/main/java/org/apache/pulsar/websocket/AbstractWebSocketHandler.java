@@ -19,6 +19,7 @@
 package org.apache.pulsar.websocket;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import static org.apache.commons.lang3.StringUtils.EMPTY;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectReader;
 import com.fasterxml.jackson.databind.ObjectWriter;
@@ -84,8 +85,9 @@ public abstract class AbstractWebSocketHandler extends PulsarWebsocketDecoder im
 
     private AuthenticationState authState;
     private String authRole = null;
-    private String authMethodName = "none";
+    private String authMethod = "none";
     private boolean pendingAuthChallengeResponse = false;
+    private int clientProtocolVersion = 0;
 
     private ScheduledFuture<?> pingFuture;
     private ScheduledFuture<?> authRefreshFuture;
@@ -105,14 +107,14 @@ public abstract class AbstractWebSocketHandler extends PulsarWebsocketDecoder im
 
     protected boolean checkAuth(ServletUpgradeResponse response) {
         authRole = "<none>";
-        authMethodName = request.getHeader(PULSAR_AUTH_METHOD_NAME);
+        authMethod = request.getHeader(PULSAR_AUTH_METHOD_NAME);
         authState = null;
         if (service.isAuthenticationEnabled()) {
             try {
-                if (authMethodName != null
-                        && service.getAuthenticationService().getAuthenticationProvider(authMethodName) != null) {
+                if (authMethod != null
+                        && service.getAuthenticationService().getAuthenticationProvider(authMethod) != null) {
                     authState = service.getAuthenticationService()
-                            .getAuthenticationProvider(authMethodName).newHttpAuthState(request);
+                            .getAuthenticationProvider(authMethod).newHttpAuthState(request);
                 }
                 if (authState != null) {
                     authRole = service.getAuthenticationService()
@@ -240,27 +242,37 @@ public abstract class AbstractWebSocketHandler extends PulsarWebsocketDecoder im
         int authenticationRefreshCheckSeconds = service.getConfig().getAuthenticationRefreshCheckSeconds();
         if (authenticationRefreshCheckSeconds > 0) {
             authRefreshFuture = service.getExecutor().scheduleAtFixedRate(() -> {
+                if (!authState.isExpired()) {
+                    // Credentials are still valid. Nothing to do at this point
+                    return;
+                }
+
+                if (pendingAuthChallengeResponse) {
+                    log.warn("[{}] Closing connection after timeout on refreshing auth credentials",
+                            session.getRemoteAddress());
+                    session.close();
+                    return;
+                }
+
+                log.info("[{}] Refreshing authentication credentials for authRole {}",
+                        getSession().getRemoteAddress(), this.authRole);
                 try {
-                    if (!authState.isExpired()) {
-                        // Credentials are still valid. Nothing to do at this point
-                        return;
-                    }
-
-                    if (pendingAuthChallengeResponse) {
-                        log.warn("[{}] Closing connection after timeout on refreshing auth credentials",
-                                session.getRemoteAddress());
-                        session.close();
-                        return;
-                    }
-
                     AuthData brokerData = authState.refreshAuthentication();
-                    CommandAuthChallenge commandAuthChallenge = newAuthChallenge(authMethodName, brokerData, 21);
+                    CommandAuthChallenge commandAuthChallenge = newAuthChallenge(authMethod, brokerData,
+                        clientProtocolVersion);
                     String commandAuthChallengeString = objectWriter().writeValueAsString(commandAuthChallenge);
 
                     session.getRemote().sendString(commandAuthChallengeString);
+
+                    if (log.isDebugEnabled()) {
+                        log.debug("[{}] Sent auth challenge to client to refresh credentials with method: {}.",
+                                getSession().getRemoteAddress(), authMethod);
+                    }
+
                     pendingAuthChallengeResponse = true;
-                } catch (javax.naming.AuthenticationException | IOException e) {
-                    log.warn("[{}] Websocket Auth refresh", getSession().getRemoteAddress(), e);
+                } catch (javax.naming.AuthenticationException e) {
+                    log.warn("[{}] Failed to refresh authentication: {}", getSession().getRemoteAddress(), e);
+                    session.close();
                 } catch (Exception e) {
                     log.warn("[{}] Websocket Auth refresh general Exception", getSession().getRemoteAddress(), e);
 

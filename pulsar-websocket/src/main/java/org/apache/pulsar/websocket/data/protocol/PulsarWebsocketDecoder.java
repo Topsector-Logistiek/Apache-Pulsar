@@ -46,12 +46,21 @@ public abstract class PulsarWebsocketDecoder extends WebSocketAdapter {
             .forType(ProducerMessage.class);
     protected final ObjectReader consumerCommandReader = ObjectMapperFactory.getMapper().reader()
             .forType(ConsumerCommand.class);
+    private String remoteAddress = null;
+
+    private String getRemoteAddress() {
+        if (getSession() != null && getSession().getRemoteAddress() != null) {
+            remoteAddress = getSession().getRemoteAddress().toString();
+        }
+        return remoteAddress;
+    }
 
     @Override
     public void onWebSocketText(String msg) {
         try {
-            log.warn("[{}] !!!!!!!!!!!! Message received: {}", getSession().getRemoteAddress(), msg);
-
+            if (log.isDebugEnabled()){
+                log.debug("[{}] Message received: {}", getRemoteAddress(), msg);
+            }
             ObjectMapper mapper = new ObjectMapper();
             JsonNode json = mapper.readTree(msg);
 
@@ -86,13 +95,13 @@ public abstract class PulsarWebsocketDecoder extends WebSocketAdapter {
                 handleMessage(producerMessageReader.readValue(msg));
             }
         } catch (JsonMappingException e) {
-            log.warn("[{}] !!!!!!!!!!!! Message received - JsonMappingException {}", getSession().getRemoteAddress(),
+            log.warn("[{}] Message received JsonMappingException {}", getRemoteAddress(),
                     e);
         } catch (JsonProcessingException e) {
-            log.warn("[{}] !!!!!!!!!!!! Message received - JsonProcessingException {}", getSession().getRemoteAddress(),
+            log.warn("[{}] Message received JsonProcessingException {}", getRemoteAddress(),
                     e);
         } catch (Exception e) {
-            log.warn("[{}] !!!!!!!!!!!! Message received - Exception {}", getSession().getRemoteAddress(),
+            log.warn("[{}] Message received Exception {}", getRemoteAddress(),
                     e);
         }
     }
@@ -136,7 +145,7 @@ public abstract class PulsarWebsocketDecoder extends WebSocketAdapter {
         try {
             getRemote().sendBytes(cmd.nioBuffer());
         } catch (IOException e) {
-            log.warn("[{}] Unable to send command {}", getRemote().getInetSocketAddress(), e);
+            log.warn("[{}] Unable to send command {}", getRemoteAddress(), e);
         }
     }
 
