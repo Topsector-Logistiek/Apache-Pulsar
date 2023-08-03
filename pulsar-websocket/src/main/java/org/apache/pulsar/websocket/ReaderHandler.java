@@ -206,17 +206,6 @@ public class ReaderHandler extends AbstractWebSocketHandler {
     public void onWebSocketText(String message) {
         super.onWebSocketText(message);
 
-        try {
-            ConsumerCommand command = consumerCommandReader.readValue(message);
-            if ("isEndOfTopic".equals(command.type)) {
-                handleEndOfTopic();
-                return;
-            }
-        } catch (IOException e) {
-            log.warn("Failed to deserialize message id: {}", message, e);
-            close(WebSocketError.FailedToDeserializeFromJSON);
-        }
-
         // We should have received an ack
         // but reader doesn't send an ack to broker here because already reader did
 
@@ -228,7 +217,8 @@ public class ReaderHandler extends AbstractWebSocketHandler {
     }
 
     // Check and notify reader if reached end of topic.
-    private void handleEndOfTopic() {
+    @Override
+    protected void handleEndOfTopic() {
         try {
             String msg = objectWriter().writeValueAsString(
                     new EndOfTopicResponse(reader.hasReachedEndOfTopic()));
