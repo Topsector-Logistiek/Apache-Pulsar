@@ -90,7 +90,8 @@ public abstract class PulsarWebsocketDecoder extends WebSocketAdapter {
                         handleAck(consumerCommandReader.readValue(msg));
 
                 }
-
+            } else if (json.has("messageId")) {
+                handleAck(consumerCommandReader.readValue(msg));
             } else {
                 handleMessage(producerMessageReader.readValue(msg));
             }
