@@ -27,6 +27,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 import javax.naming.AuthenticationException;
 import javax.servlet.http.HttpServletRequest;
@@ -219,6 +220,10 @@ public class AuthenticationService implements Closeable {
 
     public AuthenticationProvider getAuthenticationProvider(String authMethodName) {
         return providers.get(authMethodName);
+    }
+
+    public Set<String> getAuthMethodNames() {
+        return providers.keySet();
     }
 
     // called when authn enabled, but no authentication provided
