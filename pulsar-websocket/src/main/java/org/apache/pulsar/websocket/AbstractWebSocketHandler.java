@@ -31,7 +31,9 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import javax.servlet.http.HttpServletRequest;
@@ -39,7 +41,9 @@ import javax.servlet.http.HttpServletResponse;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.pulsar.broker.authentication.AuthenticationDataHttps;
 import org.apache.pulsar.broker.authentication.AuthenticationDataSource;
+import org.apache.pulsar.broker.authentication.AuthenticationProvider;
 import org.apache.pulsar.broker.authentication.AuthenticationState;
+import org.apache.pulsar.broker.web.AuthenticationFilter;
 import org.apache.pulsar.client.api.PulsarClientException.AuthenticationException;
 import org.apache.pulsar.client.api.PulsarClientException.AuthorizationException;
 import org.apache.pulsar.client.api.PulsarClientException.ConsumerBusyException;
@@ -79,11 +83,11 @@ public abstract class AbstractWebSocketHandler extends PulsarWebsocketDecoder im
 
     protected final TopicName topic;
     protected final Map<String, String> queryParams;
-    private static final String PULSAR_AUTH_METHOD_NAME = "X-Pulsar-Auth-Method-Name";
     protected final ObjectReader consumerCommandReader = ObjectMapperFactory.getMapper().reader()
             .forType(ConsumerCommand.class);
 
     private AuthenticationState authState;
+    private AuthenticationDataSource authData;
     private String authRole = null;
     private String authMethod = "none";
     private boolean pendingAuthChallengeResponse = false;
@@ -105,66 +109,122 @@ public abstract class AbstractWebSocketHandler extends PulsarWebsocketDecoder im
         });
     }
 
-    protected boolean checkAuth(ServletUpgradeResponse response) {
-        authRole = "<none>";
-        authMethod = request.getHeader(PULSAR_AUTH_METHOD_NAME);
-        authState = null;
-        if (service.isAuthenticationEnabled()) {
-            try {
-                if (authMethod != null
-                        && service.getAuthenticationService().getAuthenticationProvider(authMethod) != null) {
-                    authState = service.getAuthenticationService()
-                            .getAuthenticationProvider(authMethod).newHttpAuthState(request);
-                }
-                if (authState != null) {
-                    authRole = service.getAuthenticationService()
-                            .authenticateHttpRequest(request, authState.getAuthDataSource());
-                } else {
-                    authRole = service.getAuthenticationService().authenticateHttpRequest(request);
-                }
-                log.info("[{}:{}] Authenticated WebSocket client {} on topic {}", request.getRemoteAddr(),
-                        request.getRemotePort(), authRole, topic);
+    private String getAuthMethodName(HttpServletRequest request) {
+        return request.getHeader(AuthenticationFilter.PULSAR_AUTH_METHOD_NAME);
+    }
 
-            } catch (javax.naming.AuthenticationException e) {
-                log.warn("[{}:{}] Failed to authenticated WebSocket client {} on topic {}: {}", request.getRemoteAddr(),
-                        request.getRemotePort(), authRole, topic, e.getMessage());
-                try {
-                    response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Failed to authenticate");
-                } catch (IOException e1) {
-                    log.warn("[{}:{}] Failed to send error: {}", request.getRemoteAddr(), request.getRemotePort(),
-                            e1.getMessage(), e1);
-                }
-                return false;
-            }
+    private boolean checkAuthentication(ServletUpgradeResponse response) {
+        if (!service.isAuthenticationEnabled()) {
+            return true;
         }
+        try {
+            String authMethodNameHeader = getAuthMethodName(request);
 
-        if (service.isAuthorizationEnabled()) {
-            AuthenticationDataSource authenticationData;
-            if (authState != null) {
-                authenticationData = authState.getAuthDataSource();
+            if (authMethodNameHeader != null) {
+                AuthenticationProvider providerToUse = service.getAuthenticationService()
+                        .getAuthenticationProvider(authMethodNameHeader);
+                try {
+                    AuthenticationState authenticationState = providerToUse.newHttpAuthState(request);
+                    authData = authenticationState.getAuthDataSource();
+
+                    authRole = providerToUse.authenticateAsync(authData).get();
+                    authState = authenticationState;
+                    authMethod = authMethodNameHeader;
+                    return true;
+                } catch (javax.naming.AuthenticationException e) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Authentication failed for provider " + authMethodNameHeader + " : "
+                                + e.getMessage(), e);
+                    }
+                    throw e;
+                } catch (ExecutionException | InterruptedException e) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Authentication failed for provider " + authMethodNameHeader + " : "
+                                + e.getMessage(), e);
+                    }
+                    throw new RuntimeException(e);
+                }
             } else {
-                authenticationData = new AuthenticationDataHttps(request);
+                Set<String> authMethodNames = service.getAuthenticationService().getAuthMethodNames();
+                for (String authMethodName : authMethodNames) {
+                    try {
+                        AuthenticationProvider provider = service.getAuthenticationService()
+                                .getAuthenticationProvider(authMethodName);
+                        AuthenticationState authenticationState = provider.newHttpAuthState(request);
+                        String authenticationRole = provider
+                                .authenticateAsync(authenticationState.getAuthDataSource())
+                                .get();
+
+                        authState = authenticationState;
+                        authRole = authenticationRole;
+                        authMethod = authMethodName;
+                        return true;
+                    } catch (ExecutionException | InterruptedException | javax.naming.AuthenticationException e) {
+                        if (log.isDebugEnabled()) {
+                            log.debug("Authentication failed for provider " + authMethodName + ": "
+                                    + e.getMessage(), e);
+                        }
+                        // Ignore the exception because we don't know which authentication method is
+                        // expected here.
+                    }
+                }
             }
+            log.info("[{}:{}] Authenticated WebSocket client {} on topic {}", request.getRemoteAddr(),
+                    request.getRemotePort(), authRole, topic);
+        } catch (javax.naming.AuthenticationException e) {
+            log.warn("[{}:{}] Failed to authenticated WebSocket client {} on topic {}: {}", request.getRemoteAddr(),
+                    request.getRemotePort(), authRole, topic, e.getMessage());
             try {
-                if (!isAuthorized(authRole, authenticationData)) {
-                    log.warn("[{}:{}] WebSocket Client [{}] is not authorized on topic {}", request.getRemoteAddr(),
-                            request.getRemotePort(), authRole, topic);
-                    response.sendError(HttpServletResponse.SC_FORBIDDEN, "Not authorized");
-                    return false;
-                }
-            } catch (Exception e) {
-                log.warn("[{}:{}] Got an exception when authorizing WebSocket client {} on topic {} on: {}",
-                        request.getRemoteAddr(), request.getRemotePort(), authRole, topic, e.getMessage());
-                try {
-                    response.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "Server error");
-                } catch (IOException e1) {
-                    log.warn("[{}:{}] Failed to send error: {}", request.getRemoteAddr(), request.getRemotePort(),
-                            e1.getMessage(), e1);
-                }
-                return false;
+                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Failed to authenticate");
+            } catch (IOException e1) {
+                log.warn("[{}:{}] Failed to send error: {}", request.getRemoteAddr(), request.getRemotePort(),
+                        e1.getMessage(), e1);
             }
+            return false;
         }
-        return true;
+        return false;
+    }
+
+    private boolean checkAuthorization(ServletUpgradeResponse response) {
+        if (!service.isAuthorizationEnabled()) {
+            return true;
+        }
+
+        AuthenticationDataSource authenticationData;
+        if (authState != null) {
+            authenticationData = authState.getAuthDataSource();
+        } else {
+            authenticationData = new AuthenticationDataHttps(request);
+        }
+        try {
+            if (isAuthorized(authRole, authenticationData)) {
+                return true;
+            }
+        } catch (Exception e) {
+            log.warn("[{}:{}] Got an exception when authorizing WebSocket client {} on topic {} on: {}",
+                    request.getRemoteAddr(), request.getRemotePort(), authRole, topic, e.getMessage());
+            try {
+                response.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "Server error");
+            } catch (IOException e1) {
+                log.warn("[{}:{}] Failed to send error: {}", request.getRemoteAddr(), request.getRemotePort(),
+                        e1.getMessage(), e1);
+            }
+            return false;
+        }
+
+        try {
+            log.warn("[{}:{}] WebSocket Client [{}] is not authorized on topic {}", request.getRemoteAddr(),
+                    request.getRemotePort(), authRole, topic);
+            response.sendError(HttpServletResponse.SC_FORBIDDEN, "Not authorized");
+        } catch (IOException e1) {
+            log.warn("[{}:{}] Failed to send error: {}", request.getRemoteAddr(), request.getRemotePort(),
+                    e1.getMessage(), e1);
+        }
+        return false;
+    }
+
+    protected boolean checkAuth(ServletUpgradeResponse response) {
+        return checkAuthentication(response) && checkAuthorization(response);
     }
 
     protected static int getErrorCode(Exception e) {
@@ -242,21 +302,21 @@ public abstract class AbstractWebSocketHandler extends PulsarWebsocketDecoder im
         int authenticationRefreshCheckSeconds = service.getConfig().getAuthenticationRefreshCheckSeconds();
         if (authenticationRefreshCheckSeconds > 0) {
             authRefreshFuture = service.getExecutor().scheduleAtFixedRate(() -> {
-                if (!authState.isExpired()) {
-                    // Credentials are still valid. Nothing to do at this point
-                    return;
-                }
-
-                if (pendingAuthChallengeResponse) {
-                    log.warn("[{}] Closing connection after timeout on refreshing auth credentials",
-                            session.getRemoteAddress());
-                    session.close();
-                    return;
-                }
-
-                log.info("[{}] Refreshing authentication credentials for authRole {}",
-                        getSession().getRemoteAddress(), this.authRole);
                 try {
+                    if (!authState.isExpired()) {
+                        // Credentials are still valid. Nothing to do at this point
+                        return;
+                    }
+
+                    if (pendingAuthChallengeResponse) {
+                        log.warn("[{}] Closing connection after timeout on refreshing auth credentials",
+                                session.getRemoteAddress());
+                        session.close();
+                        return;
+                    }
+
+                    log.info("[{}] Refreshing authentication credentials for authRole {}",
+                        getSession().getRemoteAddress(), this.authRole);
                     AuthData brokerData = authState.refreshAuthentication();
                     CommandAuthChallenge commandAuthChallenge = newAuthChallenge(authMethod, brokerData,
                         clientProtocolVersion);

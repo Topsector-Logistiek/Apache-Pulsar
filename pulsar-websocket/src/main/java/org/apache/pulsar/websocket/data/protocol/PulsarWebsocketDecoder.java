@@ -85,7 +85,6 @@ public abstract class PulsarWebsocketDecoder extends WebSocketAdapter {
                     case "isEndOfTopic":
                         handleEndOfTopic();
                         break;
-
                     default:
                         handleAck(consumerCommandReader.readValue(msg));
 
