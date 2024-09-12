@@ -39,7 +39,6 @@ import org.apache.pulsar.client.impl.MessageIdImpl;
 import org.apache.pulsar.client.impl.MultiTopicsReaderImpl;
 import org.apache.pulsar.client.impl.ReaderImpl;
 import org.apache.pulsar.common.util.DateFormatter;
-import org.apache.pulsar.websocket.data.ConsumerCommand;
 import org.apache.pulsar.websocket.data.ConsumerMessage;
 import org.apache.pulsar.websocket.data.EndOfTopicResponse;
 import org.eclipse.jetty.websocket.api.Session;
